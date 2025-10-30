@@ -1,0 +1,129 @@
+name: Generate README on tag
+
+on:
+  push:
+    tags:
+      - 'sample/*'
+
+permissions:
+  contents: write
+
+jobs:
+  generate-doc:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore and Build
+        run: |
+          dotnet --info
+          dotnet restore
+          dotnet build -c Release --nologo
+
+      - name: Run program with 60s timeout and capture output
+        id: runapp
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Try to run the executable for up to 60 seconds
+          echo "Running application for up to 60 seconds to capture output..."
+          # Prefer running the specific project if present
+          if [[ -f "Rxxxxxxx.csproj" ]]; then
+            timeout 60s dotnet run --project Rxxxxxxx.csproj -c Release --no-build > app_output.txt 2>&1 || true
+          else
+            # Fallback: try running from solution
+            timeout 60s dotnet run -c Release --no-build > app_output.txt 2>&1 || true
+          fi
+          echo "---BEGIN-OUTPUT---"
+          cat app_output.txt | sed -e 's/\r$//'
+          echo "---END-OUTPUT---"
+
+      - name: Build README section content
+        id: updatereadme
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_TAG="${GITHUB_REF_NAME}"
+          TAG_NAME="${RAW_TAG#sample/}"
+          echo "Preparing README update for tag: ${TAG_NAME}"
+
+          # Read Program.cs and output
+          PROGRAM_CS_CONTENT=$(cat Program.cs)
+          APP_OUTPUT=$(cat app_output.txt)
+
+          # Extract description from Desc.md if exists: take content under heading "## <tag>" until next heading
+          DESC_CONTENT=""
+          if [[ -f "Desc.md" ]]; then
+            # Use awk to capture lines between heading matching the tag and the next heading
+            DESC_CONTENT=$(awk -v tag="$TAG_NAME" '
+              BEGIN { capture=0 }
+              /^##[[:space:]]+/ {
+                if (capture==1) { exit }
+                # Normalize heading text (strip leading ## and spaces)
+                head=$0
+                sub(/^##[[:space:]]+/, "", head)
+                sub(/[[:space:]]+$/, "", head)
+                if (head==tag) { capture=1; next }
+              }
+              {
+                if (capture==1) print $0
+              }
+            ' Desc.md)
+          fi
+
+          # Ensure README has the anchor "# 示例" after manual section; if not, append it
+          if ! grep -q "^# 示例$" README.md; then
+            echo -e "\n# 示例" >> README.md
+          fi
+
+          # Build the section content with proper Markdown fences
+          {
+            echo "";
+            echo "## ${TAG_NAME}";
+            if [[ -n "${DESC_CONTENT}" ]]; then
+              echo "";
+              echo "${DESC_CONTENT}";
+              echo "";
+            fi
+            echo "### 示例代码";
+            echo '```c#';
+            echo "${PROGRAM_CS_CONTENT}";
+            echo '```';
+            echo "";
+            echo "### 输出";
+            echo '```';
+            echo "${APP_OUTPUT}";
+            echo '```';
+          } >> README.md
+
+          echo "README.md updated.";
+
+      - name: Commit and push README update
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "docs: append tag section for ${GITHUB_REF_NAME}"
+          # Push to the default branch that contains the tag's commit
+          DEFAULT_BRANCH=$(git remote show origin | sed -n "/HEAD branch/s/.*: //p")
+          echo "Pushing README update to ${DEFAULT_BRANCH}"
+          git push origin HEAD:${DEFAULT_BRANCH}
+
+
